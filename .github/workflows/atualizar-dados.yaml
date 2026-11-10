@@ -1,0 +1,162 @@
+# Atualiza os dados dos núcleos de inflação do IPCA (MCP Análise Macro).
+#
+# O código de cálculo vive no pacote R `nucleos` (github.com/vitorwilher/nucleos);
+# este repositório só orquestra: baixa o pacote, calcula as séries e publica o
+# artefato como asset do release fixo "dashboard-dados" DESTE repositório, que o
+# MCP Worker (nucleos-mcp.analisemacro.workers.dev) lê em runtime.
+#
+# O IBGE divulga o IPCA entre os dias ~7 e ~12, sem data fixa. Em vez de um
+# cron num dia só, o workflow faz polling: roda diariamente do dia 7 ao 16 e,
+# num passo barato (uma chamada à API de agregados do IBGE + o JSON do release),
+# só segue para a coleta e o cálculo quando o SIDRA tem um mês mais novo que o
+# `ultimo_mes` do artefato publicado. Nos demais dias termina em segundos.
+on:
+  schedule:
+    - cron: "0 13 7-16 * *"   # 10h de Brasília, dias 7 a 16 (IBGE divulga às 9h)
+    - cron: "0 19 7-16 * *"   # 16h de Brasília, segunda chance no mesmo dia
+  workflow_dispatch:
+    inputs:
+      forcar:
+        description: "Recalcular e publicar mesmo sem mês novo no SIDRA"
+        type: boolean
+        default: false
+
+name: atualizar-dados
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dados-dashboard
+  cancel-in-progress: false
+
+env:
+  TABELA_SIDRA: "7060"
+  RELEASE_TAG: dashboard-dados
+  PACOTE_REPO: vitorwilher/nucleos
+  PACOTE_REF: master
+
+jobs:
+  atualizar-dados:
+    runs-on: ubuntu-latest
+    steps:
+      # --- 1. Checagem barata: há mês novo? -----------------------------------
+      - name: Comparar o último mês do SIDRA com o artefato publicado
+        id: checa
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCAR: ${{ inputs.forcar || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # Último período da tabela 7060 (API de agregados, sem chave).
+          sidra=""
+          for t in 1 2 3 4; do
+            if sidra=$(curl -fsS --max-time 60 \
+                "https://servicodados.ibge.gov.br/api/v3/agregados/${TABELA_SIDRA}/periodos" \
+                | jq -r 'map(.id) | max'); then
+              [ -n "$sidra" ] && [ "$sidra" != "null" ] && break
+            fi
+            echo "Tentativa $t de ler os períodos do SIDRA falhou; nova tentativa em $((15 * t))s."
+            sleep $((15 * t))
+          done
+          if [ -z "$sidra" ] || [ "$sidra" = "null" ]; then
+            echo "::error::Não foi possível ler os períodos da tabela ${TABELA_SIDRA} em servicodados.ibge.gov.br."
+            exit 1
+          fi
+          sidra_mes="${sidra:0:4}-${sidra:4:2}"
+
+          # ultimo_mes do artefato publicado (vazio se o release/asset não existe).
+          publicado=$(gh release download "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+                        -p series_nucleos.json -O - 2>/dev/null \
+                      | jq -r '.metadata.ultimo_mes // empty' || true)
+
+          echo "SIDRA: $sidra_mes | publicado: ${publicado:-nenhum} | forçar: $FORCAR"
+          echo "sidra_mes=$sidra_mes" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCAR" = "true" ] || [ -z "$publicado" ] || [[ "$sidra_mes" > "$publicado" ]]; then
+            echo "novo=true" >> "$GITHUB_OUTPUT"
+            echo "### Mês novo: $sidra_mes (publicado: ${publicado:-nenhum}) — recalculando" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "novo=false" >> "$GITHUB_OUTPUT"
+            echo "### Nada a fazer: artefato já está em $publicado" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # --- 2. Pré-voo: a API de dados do SIDRA responde a este runner? --------
+      - name: Testar acesso à API de dados do SIDRA
+        if: steps.checa.outputs.novo == 'true'
+        run: |
+          set -uo pipefail
+          url="https://apisidra.ibge.gov.br/values/t/${TABELA_SIDRA}/n1/all/v/63/p/last%201/c315/7169?formato=json"
+          for t in 1 2 3; do
+            code=$(curl -s -o /dev/null -D headers.txt -w '%{http_code}' --max-time 60 "$url" || echo 000)
+            [ "$code" = "200" ] && { echo "apisidra OK (HTTP 200)"; exit 0; }
+            echo "Tentativa $t: HTTP $code"
+            sleep $((30 * t))
+          done
+          if grep -qi '^cf-mitigated: *challenge' headers.txt; then
+            echo "::error::apisidra.ibge.gov.br devolveu HTTP $code com desafio do Cloudflare (cf-mitigated: challenge) para o IP deste runner. A API de dados está bloqueando robôs/IPs de nuvem; rode gerar_dados.R localmente e publique com 'gh release upload $RELEASE_TAG ... --clobber', ou use um runner self-hosted."
+          else
+            echo "::error::apisidra.ibge.gov.br respondeu HTTP $code após 3 tentativas."
+          fi
+          exit 1
+
+      # --- 3. Coleta, cálculo e publicação (só com mês novo) ------------------
+      - name: Baixar o pacote nucleos
+        uses: actions/checkout@v4
+        if: steps.checa.outputs.novo == 'true'
+        with:
+          repository: ${{ env.PACOTE_REPO }}
+          ref: ${{ env.PACOTE_REF }}
+          path: nucleos
+
+      - uses: r-lib/actions/setup-r@v2
+        if: steps.checa.outputs.novo == 'true'
+        with:
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        if: steps.checa.outputs.novo == 'true'
+        with:
+          working-directory: nucleos
+          extra-packages: local::., any::jsonlite
+          needs: website
+
+      - name: Gerar o artefato de dados (com retries)
+        if: steps.checa.outputs.novo == 'true'
+        working-directory: nucleos
+        run: |
+          for t in 1 2 3; do
+            Rscript dashboard/gerar_dados.R && exit 0
+            echo "::warning::gerar_dados.R falhou (tentativa $t); nova tentativa em $((120 * t))s."
+            sleep $((120 * t))
+          done
+          echo "::error::gerar_dados.R falhou 3 vezes. Veja acima a mensagem do SIDRA/SGS."
+          exit 1
+
+      - name: Conferir o artefato antes de publicar
+        if: steps.checa.outputs.novo == 'true'
+        env:
+          ESPERADO: ${{ steps.checa.outputs.sidra_mes }}
+        run: |
+          gerado=$(jq -r '.metadata.ultimo_mes' nucleos/dashboard/dados/series_nucleos.json)
+          echo "Artefato gerado: $gerado | SIDRA: $ESPERADO"
+          if [ "$gerado" != "$ESPERADO" ]; then
+            echo "::error::O artefato termina em $gerado, mas o SIDRA anuncia $ESPERADO. Não publico."
+            exit 1
+          fi
+
+      - name: Publicar o artefato no release
+        if: steps.checa.outputs.novo == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+              --title "Dados do dashboard (núcleos do IPCA)" \
+              --notes "Séries calculadas pelo pacote nucleos, atualizadas mensalmente. Calculadas com github.com/vitorwilher/nucleos. Consumidas pelo MCP Análise Macro (.json) e pelo app Shiny (.rds)."
+          gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            nucleos/dashboard/dados/series_nucleos.rds \
+            nucleos/dashboard/dados/series_nucleos.csv \
+            nucleos/dashboard/dados/series_nucleos.json \
+            --clobber
