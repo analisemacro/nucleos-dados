@@ -7,7 +7,7 @@
 #
 # O IBGE divulga o IPCA entre os dias ~7 e ~12, sem data fixa. Em vez de um
 # cron num dia só, o workflow faz polling: roda diariamente do dia 7 ao 16 e,
-# num passo barato (uma chamada à API de agregados do IBGE + o JSON do release),
+# num passo barato (uma consulta mínima ao SIDRA + o JSON do release),
 # só segue para a coleta e o cálculo quando o SIDRA tem um mês mais novo que o
 # `ultimo_mes` do artefato publicado. Nos demais dias termina em segundos.
 on:
@@ -49,19 +49,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Último período da tabela 7060 (API de agregados, sem chave).
+          # Último período da tabela 7060. Primeiro o apisidra (a mesma API que o
+          # pacote usa e que responde aos runners do GitHub); o servicodados fica
+          # de reserva — em nov/2026 ele não aceitava conexão dos runners (timeout).
+          ultimo_periodo() {
+            curl -fsS --connect-timeout 20 --max-time 60 \
+              "https://apisidra.ibge.gov.br/values/t/${TABELA_SIDRA}/n1/all/v/63/p/last%201/c315/7169?formato=json" \
+              | jq -r '.[1].D3C // empty' && return 0
+            curl -fsS --connect-timeout 20 --max-time 60 \
+              "https://servicodados.ibge.gov.br/api/v3/agregados/${TABELA_SIDRA}/periodos" \
+              | jq -r 'map(.id) | max'
+          }
           sidra=""
-          for t in 1 2 3 4; do
-            if sidra=$(curl -fsS --max-time 60 \
-                "https://servicodados.ibge.gov.br/api/v3/agregados/${TABELA_SIDRA}/periodos" \
-                | jq -r 'map(.id) | max'); then
-              [ -n "$sidra" ] && [ "$sidra" != "null" ] && break
-            fi
-            echo "Tentativa $t de ler os períodos do SIDRA falhou; nova tentativa em $((15 * t))s."
-            sleep $((15 * t))
+          for t in 1 2 3; do
+            sidra=$(ultimo_periodo || true)
+            [[ "$sidra" =~ ^[0-9]{6}$ ]] && break
+            echo "Tentativa $t de ler o último período do SIDRA falhou; nova tentativa em $((20 * t))s."
+            sidra=""
+            sleep $((20 * t))
           done
-          if [ -z "$sidra" ] || [ "$sidra" = "null" ]; then
-            echo "::error::Não foi possível ler os períodos da tabela ${TABELA_SIDRA} em servicodados.ibge.gov.br."
+          if [ -z "$sidra" ]; then
+            echo "::error::Não foi possível ler o último período da tabela ${TABELA_SIDRA} (apisidra nem servicodados)."
             exit 1
           fi
           sidra_mes="${sidra:0:4}-${sidra:4:2}"
